@@ -1,6 +1,8 @@
 <?php
 
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\AgoraVideoController;
 
 /*
 |--------------------------------------------------------------------------
@@ -13,10 +15,12 @@ use Illuminate\Support\Facades\Route;
 |
 */
 
-Route::get('/', function () {
-    return view('welcome');
-});
+
 
 Auth::routes();
 
-Route::get('/home', [App\Http\Controllers\HomeController::class, 'index'])->name('home');
+Route::group(['middleware' => ['auth']], function () {
+    Route::get('/', [AgoraVideoController::class, 'index']);
+    Route::post('/agora/token', [AgoraVideoController::class, 'token']);
+    Route::post('/agora/call-user', [AgoraVideoController::class, 'callUser']);
+});
