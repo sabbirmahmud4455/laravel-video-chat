@@ -1,16 +1,9 @@
 <template>
     <main>
-      <div class="container">
-        <div class="row">
-          <div class="col-12 text-center">
-            <img src="img/agora-logo.png" alt="Agora Logo" class="img-fuild" />
-          </div>
-        </div>
-      </div>
       <div class="container my-5">
         <div class="row">
           <div class="col">
-            <div class="btn-group" role="group">
+            <div class="btn-group" role="group" v-if="onCallUserId == null && incomingCall == false">
               <button
                 type="button"
                 class="btn btn-primary mr-2"
@@ -45,7 +38,7 @@
               <button
                 type="button"
                 class="btn btn-success ml-5"
-                @click="acceptCall"
+                @click="acceptCall(incomingCallerId)"
               >
                 Accept
               </button>
@@ -56,8 +49,9 @@
       </div>
 
       <section id="video-container" v-if="callPlaced">
-        <div id="local-video"></div>
-        <div id="remote-video"></div>
+        <video  id="local-video" ref="video-there" autoplay></video>
+        <video  id="remote-video" ref="video-here" autoplay></video>
+
 
         <div class="action-btns">
           <button type="button" class="btn btn-info" @click="handleAudioToggle">
@@ -80,11 +74,12 @@
 
   <script>
 
-// import AgoraRTC from 'agora-rtc-sdk-ng'
+    import Pusher from 'pusher-js';
+    import Peer from 'simple-peer';
 
   export default {
     name: "AgoraChat",
-    props: ["authuser", "authuserid", "allusers", "agora_id"],
+    props: ["authuser", "authuserid", "allusers", "agora_id",                                            'user', 'others', 'pusherKey', 'pusherCluster'],
     data() {
       return {
         callPlaced: false,
@@ -96,14 +91,81 @@
         onlineUsers: [],
         incomingCall: false,
         incomingCaller: "",
+        incomingCallerId: null,
         agoraChannel: null,
+        onCallUserId: null,
+        channel: null,
+        stream: null,
+        peers: {},
       };
     },
     mounted() {
       this.initUserOnlineChannel();
       this.initUserOnlineListeners();
+      this.setupVideoChat();
     },
     methods: {
+
+        startVideoChat(userId) {
+        this.getPeer(userId, true);
+        },
+
+        getPeer(userId, initiator) {
+        if(this.peers[userId] === undefined) {
+            let peer = new Peer({
+            initiator,
+            stream: this.localStream,
+            trickle: false
+            });
+            peer.on('signal', (data) => {
+            this.channel.trigger(`client-signal-${userId}`, {
+                userId: this.user.id,
+                data: data
+            });
+            })
+            .on('stream', (stream) => {
+                const videoThere = this.$refs['video-there'];
+                const videoHere = this.$refs['video-here'];
+                videoHere.srcObject = stream;
+                videoThere.srcObject = this.localStream;
+            })
+            .on('close', () => {
+            const peer = this.peers[userId];
+            if(peer !== undefined) {
+                peer.destroy();
+            }
+            delete this.peers[userId];
+            });
+            this.peers[userId] = peer;
+        }
+        return this.peers[userId];
+        },
+
+        async setupVideoChat() {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        this.localStream = stream;
+
+        const pusher = this.getPusherInstance();
+        this.channel = pusher.subscribe('presence-video-chat');
+        this.channel.bind(`client-signal-${this.user.id}`, (signal) =>
+        {
+            const peer = this.getPeer(signal.userId, false);
+            peer.signal(signal.data);
+        });
+        },
+        getPusherInstance() {
+        return new Pusher(this.pusherKey, {
+            authEndpoint: '/auth/video_chat',
+            cluster: this.pusherCluster,
+            auth: {
+            headers: {
+                'X-CSRF-Token': document.head.querySelector('meta[name="csrf-token"]').content
+            }
+            }
+        });
+        },
+
+
       /**
        * Presence Broadcast Channel Listeners and Methods
        * Provided by Laravel.
@@ -138,11 +200,47 @@
               (user) => user.id === data.from
             );
             this.incomingCaller = this.onlineUsers[callerIndex]["name"];
+            this.incomingCallerId = this.onlineUsers[callerIndex]["id"];
             this.incomingCall = true;
             // the channel that was sent over to the user being called is what
             // the receiver will use to join the call when accepting the call.
             this.agoraChannel = data.channelName;
           }
+        });
+        this.userOnlineChannel.listen("EndAgoraCall", ({ data }) => {
+            if (parseInt(data.userToCall) === parseInt(this.authuserid)) {
+                if (this.localStream && this.localStream.getTracks()) {
+                    const tracks = this.localStream.getTracks();
+                    tracks.forEach((track) => {
+                    track.stop();
+                    });
+                }
+
+                this.callPlaced = false;
+                this.client = null;
+                this.localStream = null;
+                this.mutedAudio = false;
+                this.mutedVideo = false;
+                this.onCallUserId = null;
+            }
+        });
+        this.userOnlineChannel.listen("DeclineAgoraCall", ({ data }) => {
+
+            if (parseInt(data.userToCall) === parseInt(this.authuserid)) {
+                if (this.localStream && this.localStream.getTracks()) {
+                    const tracks = this.localStream.getTracks();
+                    tracks.forEach((track) => {
+                    track.stop();
+                    });
+                }
+
+                this.callPlaced = false;
+                this.client = null;
+                this.localStream = null;
+                this.mutedAudio = false;
+                this.mutedVideo = false;
+                this.onCallUserId = null;
+            }
         });
       },
       getUserOnlineStatus(id) {
@@ -156,31 +254,67 @@
       },
       async placeCall(id, calleeName) {
         try {
+        this.onCallUserId = id;
           // channelName = the caller's and the callee's id. you can use anything. tho.
           const channelName = `${this.authuser}_${calleeName}`;
-          const tokenRes = await this.generateToken(channelName);
-          // Broadcasts a call event to the callee and also gets back the token
           await axios.post("/agora/call-user", {
             user_to_call: id,
             username: this.authuser,
             channel_name: channelName,
+          })
+          .then(()=> {
+            this.incomingCall = false;
+            this.callPlaced = true;
+
           });
-          this.initializeAgora();
-          this.joinRoom(tokenRes.data, channelName);
         } catch (error) {
           console.log(error);
         }
       },
-      async acceptCall() {
-        this.initializeAgora();
-        const tokenRes = await this.generateToken(this.agoraChannel);
-        this.joinRoom(tokenRes.data, this.agoraChannel);
+      async acceptCall(incomingCallerId) {
+        this.getPeer(incomingCallerId, true);
         this.incomingCall = false;
         this.callPlaced = true;
+        this.onCallUserId = incomingCallerId;
       },
-      declineCall() {
-        // You can send a request to the caller to
-        // alert them of rejected call
+      async declineCall() {
+
+        try {
+          // channelName = the caller's and the callee's id. you can use anything. tho.
+          const channelName = `${this.authuser}_${this.incomingCallerId}`;
+          await axios.post("/agora/call-decline", {
+            user_to_call: this.incomingCallerId,
+            channel_name: channelName,
+          })
+          .then(()=> {
+
+            if (this.localStream && this.localStream.getTracks()) {
+                const tracks = this.localStream.getTracks();
+                tracks.forEach((track) => {
+                track.stop();
+                });
+            }
+            this.callPlaced = false;
+            this.client = null;
+            this.localStream = null;
+            this.mutedAudio = false;
+            this.mutedVideo = false;
+            this.onCallUserId = null;
+
+          });
+        } catch (error) {
+          console.log(error);
+        }
+
+
+
+
+
+
+
+
+
+
         this.incomingCall = false;
       },
       generateToken(channelName) {
@@ -191,10 +325,6 @@
       /**
        * Agora Events and Listeners
        */
-
-
-
-
       initializeAgora() {
         // this.client =  AgoraRTC.createClient({ mode: "rtc", codec: "h264" });
         // this.client.init(
@@ -215,14 +345,6 @@
                 console.log("AgoraRTC client initialization failed", err);
             });
       },
-
-
-
-
-
-
-
-
       async joinRoom(token, channel) {
 
 
@@ -232,10 +354,9 @@
           this.authuser,
           (uid) => {
 
-
             console.log("User " + uid + " join channel successfully");
             this.callPlaced = true;
-            this.createLocalStream();
+            // this.createLocalStream();
             this.initializedAgoraListeners();
           },
           (err) => {
@@ -277,54 +398,57 @@
           console.log(evt);
         });
       },
-      createLocalStream() {
-        this.localStream = AgoraRTC.createStream({
-          audio: true,
-          video: true,
-        });
-        // Initialize the local stream
-        this.localStream.init(
-          () => {
-            // Play the local stream
-            this.localStream.play("local-video");
-            // Publish the local stream
-            this.client.publish(this.localStream, (err) => {
-              console.log("publish local stream", err);
-            });
-          },
-          (err) => {
-            console.log(err);
-          }
-        );
-      },
-      endCall() {
-        this.localStream.close();
-        this.client.leave(
-          () => {
-            console.log("Leave channel successfully");
+
+      async endCall() {
+        try {
+          // channelName = the caller's and the callee's id. you can use anything. tho.
+          const channelName = `${this.authuser}_${this.onCallUserId}`;
+          await axios.post("/agora/call-end", {
+            user_to_call: this.onCallUserId,
+            channel_name: channelName,
+          })
+          .then(()=> {
+
+            if (this.localStream && this.localStream.getTracks()) {
+                const tracks = this.localStream.getTracks();
+                tracks.forEach((track) => {
+                track.stop();
+                });
+            }
+
             this.callPlaced = false;
-          },
-          (err) => {
-            console.log("Leave channel failed");
-          }
-        );
+            this.client = null;
+            this.localStream = null;
+            this.mutedAudio = false;
+            this.mutedVideo = false;
+            this.onCallUserId = null;
+
+
+          });
+        } catch (error) {
+          console.log(error);
+        }
       },
       handleAudioToggle() {
-        if (this.mutedAudio) {
-          this.localStream.unmuteAudio();
-          this.mutedAudio = false;
-        } else {
-          this.localStream.muteAudio();
+        const audioTrack = this.localStream.getAudioTracks()[0]; // Assuming there is only one audio track
+
+        if (audioTrack.enabled) {
+          audioTrack.enabled = false;
           this.mutedAudio = true;
+
+        } else {
+          audioTrack.enabled = true;
+          this.mutedAudio = false;
         }
       },
       handleVideoToggle() {
-        if (this.mutedVideo) {
-          this.localStream.unmuteVideo();
-          this.mutedVideo = false;
-        } else {
-          this.localStream.muteVideo();
+        const videoTrack = this.localStream.getVideoTracks()[0]; // Assuming there is only one audio track
+        if (videoTrack.enabled) {
+          videoTrack.enabled = false;
           this.mutedVideo = true;
+        } else {
+          videoTrack.enabled = true;
+          this.mutedVideo = false;
         }
       },
     },
@@ -332,6 +456,9 @@
   </script>
 
   <style scoped>
+
+
+
   main {
     margin-top: 50px;
   }
@@ -339,7 +466,7 @@
     width: 700px;
     height: 500px;
     max-width: 90vw;
-    max-height: 50vh;
+    max-height: 70vh;
     margin: 0 auto;
     border: 1px solid #099dfd;
     position: relative;
@@ -356,7 +483,9 @@
     border-radius: 6px;
     z-index: 2;
     cursor: pointer;
+    z-index: 2;
   }
+
   #remote-video {
     width: 100%;
     height: 100%;
@@ -369,7 +498,9 @@
     margin: 0;
     padding: 0;
     cursor: pointer;
+    z-index: 1;
   }
+
   .action-btns {
     position: absolute;
     bottom: 20px;
